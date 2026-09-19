@@ -406,6 +406,189 @@ def test_participant_busy_calendar_uses_its_own_dst():
     assert free.status_code == 200
 
 # ---------------------------------------------------------------------------
+# Overlapping preferred ranges: merged into a union before scoring
+# ---------------------------------------------------------------------------
+
+
+def test_overlapping_preferred_ranges_count_overlap_once():
+    # Ranges 08:00-10:00 and 09:00-11:00 overlap 09:00-10:00. The 09:30
+    # meeting lies inside both ranges, so it costs 0; the pre-fix code
+    # counted the overlap twice and reported -30.
+    resp = rotation(
+        dates=("2026-03-05",),
+        candidate_times=("09:30",),
+        participants=[
+            participant(
+                "alice",
+                preferred_ranges=[
+                    {"start": "08:00", "end": "10:00"},
+                    {"start": "09:00", "end": "11:00"},
+                ],
+            )
+        ],
+    )
+    data = resp.json()
+    assert data["meetings"][0]["deviations"] == {"alice": 0}
+    assert data["cumulative_costs"] == {"alice": 0}
+    assert data["max_deviation"] == 0
+    assert data["total_deviation"] == 0
+
+
+def test_partially_overlapping_ranges_count_minutes_once():
+    # Ranges 09:00-09:45 and 09:30-10:00 overlap 09:30-09:45; their union
+    # covers 09:30-10:00 of the 09:30-10:30 meeting, so 30 minutes deviate.
+    # Before merging: 15 + 30 inside -> a bogus 15-minute deviation.
+    resp = rotation(
+        dates=("2026-03-05",),
+        candidate_times=("09:30",),
+        participants=[
+            participant(
+                "alice",
+                preferred_ranges=[
+                    {"start": "09:00", "end": "09:45"},
+                    {"start": "09:30", "end": "10:00"},
+                ],
+            )
+        ],
+    )
+    data = resp.json()
+    assert data["meetings"][0]["deviations"] == {"alice": 30}
+    assert data["cumulative_costs"] == {"alice": 30}
+
+
+def test_touching_preferred_ranges_merge_as_one_period():
+    # 09:00-09:30 and 09:30-10:00 merely touch; back-to-back half-open
+    # ranges merge, so a 09:00-10:00 meeting is fully preferred.
+    resp = rotation(
+        dates=("2026-03-05",),
+        candidate_times=("09:00",),
+        participants=[
+            participant(
+                "alice",
+                preferred_ranges=[
+                    {"start": "09:00", "end": "09:30"},
+                    {"start": "09:30", "end": "10:00"},
+                ],
+            )
+        ],
+    )
+    data = resp.json()
+    assert data["meetings"][0]["deviations"] == {"alice": 0}
+
+
+def test_overlapping_preferences_do_not_skew_selection():
+    # Alice's ranges 08:00-09:30 and 09:00-10:00 overlap 09:00-09:30; their
+    # union covers BOTH candidates, so 08:00 and 09:00 both cost her 0. Bob
+    # has no preferences, so every candidate costs him 60 on each of the
+    # two dates: all four schedules tie at (max 120, total 120) and the
+    # input-order tie-break chooses 08:00 both days. Pre-fix, the 09:00
+    # overlap was counted twice (-30 for alice per meeting), so the
+    # all-09:00 schedule showed total 60 with alice at -60 and stole the
+    # pick -- changing the chosen candidates.
+    resp = rotation(
+        dates=("2026-03-05", "2026-03-06"),
+        candidate_times=("08:00", "09:00"),
+        participants=[
+            participant(
+                "alice",
+                preferred_ranges=[
+                    {"start": "08:00", "end": "09:30"},
+                    {"start": "09:00", "end": "10:00"},
+                ],
+            ),
+            participant("bob", preferred_ranges=[]),
+        ],
+    )
+    data = resp.json()
+    assert [m["candidate_index"] for m in data["meetings"]] == [0, 0]
+    assert all(
+        m["deviations"] == {"alice": 0, "bob": 60} for m in data["meetings"]
+    )
+    assert data["cumulative_costs"] == {"alice": 0, "bob": 120}
+    assert data["max_deviation"] == 120
+    assert data["total_deviation"] == 120
+
+
+def test_deviation_always_within_zero_and_duration():
+    # Dense mutually overlapping ranges used to drive deviations negative;
+    # every per-meeting deviation must stay in [0, duration] and cumulative
+    # costs in [0, duration * number of meetings], including for the
+    # 23:30 candidate that crosses UTC midnight.
+    resp = rotation(
+        dates=("2026-03-05", "2026-03-06"),
+        candidate_times=("07:00", "09:30", "12:00", "23:30"),
+        duration_minutes=60,
+        participants=[
+            participant(
+                "alice",
+                preferred_ranges=[
+                    {"start": "08:00", "end": "10:00"},
+                    {"start": "09:00", "end": "11:00"},
+                    {"start": "09:30", "end": "10:30"},
+                ],
+            ),
+        ],
+    )
+    data = resp.json()
+    for meeting in data["meetings"]:
+        for minutes in meeting["deviations"].values():
+            assert 0 <= minutes <= 60
+        for minutes in meeting["cumulative_costs"].values():
+            assert 0 <= minutes <= 120
+    assert data["max_deviation"] >= 0
+    assert data["total_deviation"] >= 0
+
+
+def test_overlapping_ranges_counted_once_across_local_midnight():
+    # The 23:30Z Mar 4 meeting runs 08:30-09:30 next local day in Tokyo
+    # (UTC+9). Ranges 08:00-09:30 and 09:00-10:00 overlap 09:00-09:30 but
+    # together cover the whole meeting, which must still cost 0.
+    resp = rotation(
+        organizer_timezone="UTC",
+        dates=("2026-03-04",),
+        candidate_times=("23:30",),
+        participants=[
+            participant(
+                "alice",
+                timezone="Asia/Tokyo",
+                preferred_ranges=[
+                    {"start": "08:00", "end": "09:30"},
+                    {"start": "09:00", "end": "10:00"},
+                ],
+            )
+        ],
+    )
+    assert resp.json()["meetings"][0]["deviations"] == {"alice": 0}
+
+
+def test_overlapping_preferences_merge_across_participant_dst():
+    # New York springs forward 2026-03-08. Overlapping ranges
+    # 08:30-10:00 and 09:00-10:30 local cover the whole 09:00 local
+    # meeting on both the EST date (14:00Z) and the EDT date (13:00Z);
+    # the 09:00-10:00 overlap must not be double counted on either side.
+    resp = rotation(
+        organizer_timezone="UTC",
+        dates=("2026-03-06", "2026-03-09"),
+        candidate_times=("14:00", "13:00"),
+        participants=[
+            participant(
+                "alice",
+                timezone="America/New_York",
+                preferred_ranges=[
+                    {"start": "08:30", "end": "10:00"},
+                    {"start": "09:00", "end": "10:30"},
+                ],
+            )
+        ],
+    )
+    data = resp.json()
+    assert [m["candidate_index"] for m in data["meetings"]] == [0, 1]
+    assert all(m["deviations"] == {"alice": 0} for m in data["meetings"])
+    assert data["cumulative_costs"] == {"alice": 0}
+    assert data["max_deviation"] == 0
+
+
+# ---------------------------------------------------------------------------
 # Errors: 422
 # ---------------------------------------------------------------------------
 

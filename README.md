@@ -1200,11 +1200,15 @@ Feasibility and cost semantics:
   intervals that merely touch do not conflict.
 - A meeting's **deviation** for one participant is the number of meeting
   minutes that fall outside that participant's `preferred_ranges`,
-  measured on the participant's own local clock. A meeting crossing the
-  participant's local midnight is split across the two local dates, so a
-  preference covering either side is honored minute by minute. An empty
-  `preferred_ranges` list means no preference, so every meeting minute
-  deviates.
+  measured on the participant's own local clock. The ranges are
+  materialized on each occupied local date, converted to UTC, and merged
+  into a union (overlapping or merely touching ranges collapse) before
+  intersecting with the half-open meeting, so a minute covered by several
+  ranges counts once and every per-meeting deviation is always between
+  `0` and the meeting duration. A meeting crossing the participant's local
+  midnight is split across the two local dates, so a preference covering
+  either side is honored minute by minute. An empty `preferred_ranges`
+  list means no preference, so every meeting minute deviates.
 - The objective minimized over the complete Cartesian product of
   feasible candidates is lexicographic: (1) the **maximum** cumulative
   deviation any single participant accrues over all meetings, (2) the
@@ -1634,10 +1638,16 @@ types) are normal request-validation `422`s.
   meeting is projected onto the participant's timezone and compared
   against the preferred periods materialized on the local dates it
   occupies; the preferred periods are localized back to UTC per date, so
-  they too follow DST. Minutes inside any preferred period do not count;
-  every other meeting minute does. A meeting crossing local midnight is
-  evaluated against both dates, and empty `preferred_ranges` makes the
-  whole meeting deviate.
+  they too follow DST. The UTC periods are then sorted and merged into a
+  union — overlapping or end-to-end touching ranges collapse — *before*
+  intersecting with the half-open meeting, so minutes inside several
+  preferred ranges at once count only once; a meeting's deviation is
+  consequently always in the range `0..duration_minutes` and can never go
+  negative (which used to skew `cumulative_costs`, `max_deviation` and
+  even the winning candidates). Minutes inside any preferred period do
+  not count; every other meeting minute does. A meeting crossing local
+  midnight is evaluated against both dates, and empty `preferred_ranges`
+  makes the whole meeting deviate.
 - **Joint lexicographic optimization**: one candidate is picked per date
   and the complete Cartesian product is scored on final cumulative costs
   only — minimizing a single meeting greedily is never done. The score is
