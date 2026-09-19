@@ -406,6 +406,214 @@ def test_participant_busy_calendar_uses_its_own_dst():
     assert free.status_code == 200
 
 # ---------------------------------------------------------------------------
+# Overlapping / touching preferred ranges count their union, never their sum
+# ---------------------------------------------------------------------------
+
+
+def test_overlapping_preferences_count_union_not_sum():
+    # Two ranges covering the whole 60-minute meeting and overlapping each
+    # other for 30 minutes: the union is 08:00-09:00, so deviation is 0.
+    # Summing the intersections instead would subtract 90 inside-minutes
+    # from a 60-minute meeting and report a deviation of -30.
+    resp = rotation(
+        candidate_times=("08:00",),
+        dates=("2026-03-02",),
+        participants=[
+            participant(
+                "alice",
+                preferred_ranges=[
+                    {"start": "08:00", "end": "08:45"},
+                    {"start": "08:30", "end": "09:00"},
+                ],
+            )
+        ],
+    )
+    assert resp.status_code == 200
+    meeting = resp.json()["meetings"][0]
+    assert meeting["deviations"] == {"alice": 0}
+    assert meeting["cumulative_costs"] == {"alice": 0}
+    assert resp.json()["max_deviation"] == 0
+    assert resp.json()["total_deviation"] == 0
+
+
+def test_partially_overlapping_preferences_count_union():
+    # 30-minute meeting 08:00-08:30; ranges [08:00, 08:15] and
+    # [08:10, 08:40] overlap on 08:10-08:15. Their union covers
+    # 08:00-08:30 in full, so the meeting deviates 0 minutes; a naive
+    # per-range sum would count 35 inside-minutes and report -5.
+    resp = rotation(
+        candidate_times=("08:00",),
+        dates=("2026-03-02",),
+        duration_minutes=30,
+        participants=[
+            participant(
+                "alice",
+                preferred_ranges=[
+                    {"start": "08:00", "end": "08:15"},
+                    {"start": "08:10", "end": "08:40"},
+                ],
+            )
+        ],
+    )
+    meeting = resp.json()["meetings"][0]
+    assert meeting["deviations"] == {"alice": 0}
+    assert resp.json()["max_deviation"] == 0
+
+
+def test_overlap_outside_meeting_does_not_inflate_coverage():
+    # The ranges overlap each other for 10 minutes; their union reaches
+    # only 08:20, so it covers the first 20 minutes of the 60-minute
+    # meeting. That shared overlap must not be double-subtracted from the
+    # meeting.
+    resp = rotation(
+        candidate_times=("08:00",),
+        dates=("2026-03-02",),
+        participants=[
+            participant(
+                "alice",
+                preferred_ranges=[
+                    {"start": "07:50", "end": "08:20"},
+                    {"start": "08:10", "end": "08:20"},
+                ],
+            )
+        ],
+    )
+    meeting = resp.json()["meetings"][0]
+    assert meeting["deviations"] == {"alice": 40}
+    assert 0 <= meeting["deviations"]["alice"] <= 60
+
+
+def test_touching_preferences_merge_like_overlapping_ones():
+    # Two back-to-back ranges cover the whole meeting; touching intervals
+    # merge so coverage is still exactly the meeting length (never more).
+    resp = rotation(
+        candidate_times=("08:00",),
+        dates=("2026-03-02",),
+        participants=[
+            participant(
+                "alice",
+                preferred_ranges=[
+                    {"start": "08:00", "end": "08:30"},
+                    {"start": "08:30", "end": "09:00"},
+                ],
+            )
+        ],
+    )
+    meeting = resp.json()["meetings"][0]
+    assert meeting["deviations"] == {"alice": 0}
+
+
+def test_identical_preferences_do_not_double_count():
+    # Stating the same preferred period twice must be equivalent to once.
+    resp = rotation(
+        candidate_times=("08:15",),
+        dates=("2026-03-02",),
+        participants=[
+            participant(
+                "alice",
+                preferred_ranges=[
+                    {"start": "08:00", "end": "08:30"},
+                    {"start": "08:00", "end": "08:30"},
+                ],
+            )
+        ],
+    )
+    meeting = resp.json()["meetings"][0]
+    # Only the 08:15-08:30 half (15 minutes) lies inside the preference.
+    assert meeting["deviations"] == {"alice": 45}
+
+
+def test_overlapping_preferences_do_not_change_candidate_choice():
+    # 30-minute meetings on two dates; candidate 0 at 08:00, candidate 1
+    # at 16:00.
+    # Alice: union [08:00, 08:10] (two ranges each contribute 10 minutes,
+    # their intersection is 08:00-08:10) -> c0 costs 20, c1 costs 30.
+    # Bob:   preference 16:20-16:30      -> c0 costs 30, c1 costs 20.
+    # Fair rotation alternates: c0 on day 1, c1 on day 2, both finish at
+    # cumulative 50. Double counting would make Alice's c0 look like 10
+    # and all-c0 would win with (20, 60) instead.
+    resp = rotation(
+        candidate_times=("08:00", "16:00"),
+        duration_minutes=30,
+        participants=[
+            participant(
+                "alice",
+                preferred_ranges=[
+                    {"start": "08:00", "end": "08:10"},
+                    {"start": "07:30", "end": "08:10"},
+                ],
+            ),
+            participant(
+                "bob",
+                preferred_ranges=[{"start": "16:20", "end": "16:30"}],
+            ),
+        ],
+    )
+    assert resp.status_code == 200
+    data = resp.json()
+    assert [m["candidate_index"] for m in data["meetings"]] == [0, 1]
+    assert data["meetings"][0]["deviations"] == {"alice": 20, "bob": 30}
+    assert data["meetings"][1]["deviations"] == {"alice": 30, "bob": 20}
+    assert data["cumulative_costs"] == {"alice": 50, "bob": 50}
+    assert data["max_deviation"] == 50
+    assert data["total_deviation"] == 100
+    for meeting in data["meetings"]:
+        for minutes in meeting["deviations"].values():
+            assert 0 <= minutes <= 30
+
+
+def test_overlapping_preferences_crossing_local_midnight_count_union():
+    # Same overlap situation as the plain union test, but the UTC meeting
+    # crosses the participant's local midnight (Tokyo, UTC+9): 23:30Z is
+    # 08:30 next-day local. Both same-morning ranges must merge before
+    # intersecting that local slice.
+    resp = rotation(
+        organizer_timezone="UTC",
+        dates=("2026-03-04",),
+        candidate_times=("23:30",),
+        duration_minutes=60,
+        participants=[
+            participant(
+                "alice",
+                timezone="Asia/Tokyo",
+                preferred_ranges=[
+                    {"start": "08:00", "end": "09:00"},
+                    {"start": "08:30", "end": "09:30"},
+                ],
+            )
+        ],
+    )
+    meeting = resp.json()["meetings"][0]
+    # Union 08:00-09:30 covers the local 08:30-09:30 meeting completely.
+    assert meeting["deviations"] == {"alice": 0}
+
+
+def test_overlapping_preferences_on_a_dst_day_count_union():
+    # America/New_York springs forward on 2026-03-08 (a 23-hour local day).
+    # A 09:00Z meeting is 05:00-06:00 EDT; two overlapping early-morning
+    # ranges union to 04:00-06:00, covering the whole meeting.
+    resp = rotation(
+        organizer_timezone="UTC",
+        dates=("2026-03-08",),
+        candidate_times=("09:00",),
+        duration_minutes=60,
+        participants=[
+            participant(
+                "alice",
+                timezone="America/New_York",
+                preferred_ranges=[
+                    {"start": "04:00", "end": "05:30"},
+                    {"start": "05:00", "end": "06:00"},
+                ],
+            )
+        ],
+    )
+    meeting = resp.json()["meetings"][0]
+    assert meeting["start"] == "2026-03-08T09:00:00Z"
+    assert meeting["deviations"] == {"alice": 0}
+
+
+# ---------------------------------------------------------------------------
 # Errors: 422
 # ---------------------------------------------------------------------------
 

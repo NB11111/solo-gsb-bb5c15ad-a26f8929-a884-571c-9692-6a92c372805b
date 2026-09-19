@@ -23,7 +23,11 @@ A candidate's deviation for one participant is the number of minutes of
 the meeting that fall outside that participant's preferred local periods,
 measured on the participant's own local clock. All local wall-clock
 construction goes through ``zoneinfo`` date by date, so DST transitions
-(including 23/25-hour days) are handled correctly in every timezone.
+(including 23/25-hour days) are handled correctly in every timezone. The
+per-date UTC preferred intervals are merged (overlapping or touching
+ranges collapse into one span) before intersecting the half-open meeting
+interval, so a meeting minute covered by several ranges counts exactly
+once and every deviation lies between 0 and the meeting length.
 
 The complete Cartesian product of feasible candidates is enumerated; when
 it exceeds ``MAX_COMBINATIONS`` (or any date has no feasible candidate) a
@@ -267,11 +271,16 @@ def _deviation(
 
     Both the meeting and the preferred periods are projected onto the
     participant's own local clock; the preferred intervals are localized
-    back to UTC per occupied local date, so their offsets follow DST. With
-    no preferred periods the whole meeting counts as deviation.
+    back to UTC per occupied local date, so their offsets follow DST. The
+    per-date intervals are merged first (overlapping or touching spans
+    collapse, including two ranges stated in the same request that
+    intersect), so the overlap minutes counted below can never exceed the
+    meeting length. With no preferred periods the whole meeting counts as
+    deviation.
     """
+    duration = end - start
     if not participant.preferences:
-        return int((end - start).total_seconds() // 60)
+        return int(duration.total_seconds() // 60)
 
     local_start = start.astimezone(tz)
     local_end = end.astimezone(tz)
@@ -284,7 +293,11 @@ def _deviation(
             if p_end > p_start:  # skip inverted/zero periods (validated upstream)
                 preferred_utc.append((p_start, p_end))
         day += DAY
-    preferred_utc.sort()
+
+    # Merge overlapping/touching UTC intervals before intersecting the
+    # meeting: without this, minutes covered by two intersecting ranges
+    # would be counted twice and the deviation could even go negative.
+    preferred_utc = _merge_intervals(preferred_utc)
 
     inside = dt.timedelta()
     for p_start, p_end in preferred_utc:
@@ -292,13 +305,35 @@ def _deviation(
         o_end = end if end < p_end else p_end
         if o_end > o_start:
             inside += o_end - o_start
-    deviation = (end - start) - inside
+    deviation = duration - inside
     return int(deviation.total_seconds() // 60)
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+def _merge_intervals(
+    intervals: list[tuple[dt.datetime, dt.datetime]],
+) -> list[tuple[dt.datetime, dt.datetime]]:
+    """Sort and merge overlapping or touching half-open intervals.
+
+    Half-open intervals [start, end) carry no free instant between
+    ``[a, b)`` and ``[b, c)``, so adjacent intervals merge as well.
+    """
+    if not intervals:
+        return []
+    ordered = sorted(intervals)
+    merged: list[tuple[dt.datetime, dt.datetime]] = [ordered[0]]
+    for start, end in ordered[1:]:
+        last_start, last_end = merged[-1]
+        if start <= last_end:
+            if end > last_end:
+                merged[-1] = (last_start, end)
+        else:
+            merged.append((start, end))
+    return merged
 
 
 def _any_overlap(
